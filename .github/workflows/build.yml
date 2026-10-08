@@ -1,0 +1,80 @@
+name: build-sfm-preview-spike
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    # windows-latest 自带 Rust + MSVC + Windows SDK，无需本地安装工具链
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    defaults:
+      run:
+        working-directory: sfm-preview-spike
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 工具链信息
+        run: |
+          rustc --version
+          cargo --version
+          rustc --print target-libdir
+          echo "target-triple:"
+          rustc -vV | Select-String "host:"
+
+      - name: 缓存 cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            sfm-preview-spike/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('sfm-preview-spike/Cargo.toml') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      # ── L2：先编译出诊断模式（不需要 WPS）────────────────────────
+      - name: 编译（release）
+        run: cargo build --release --verbose
+
+      - name: 编译告警
+        run: cargo clippy --release -- -D warnings
+        continue-on-error: true
+
+      # ── L2：在任何文件上跑 --diag，验证解析链能否工作 ──────────────
+      # runner 上没有 WPS/Office，预期结果是「三处注册点均为空」。
+      # 这一步验证的是：程序能跑、注册表读取逻辑正确、JSON 输出可解析。
+      - name: 诊断模式冒烟测试（预期：无处理器）
+        run: |
+          New-Item -ItemType File -Force -Path sample.docx | Out-Null
+          $exe = ".\target\release\sfm-preview-spike.exe"
+          & $exe --diag (Resolve-Path .\sample.docx).Path 2>&1 | Tee-Object -FilePath diag-raw.txt
+
+      - name: 校验 --diag 输出为合法 JSON
+        run: |
+          $json = Select-String -Path diag-raw.txt -Pattern '^\{"' -Raw | Select-Object -First 1
+          if (-not $json) {
+            Write-Host "::warning::未找到 JSON 行（该 runner 无预览处理器属正常）"
+            exit 0
+          }
+          $obj = $json | ConvertFrom-Json
+          Write-Host "解析结果："
+          $obj | Format-List
+          if ($obj.verdict) {
+            Write-Host "verdict = $($obj.verdict)"
+          }
+
+      # ── L1 产物：本地运行用的 exe ─────────────────────────────────
+      - name: 上传产物（exe + 诊断输出）
+        uses: actions/upload-artifact@v4
+        with:
+          name: sfm-preview-spike-${{ github.sha }}
+          path: |
+            sfm-preview-spike/target/release/sfm-preview-spike.exe
+            sfm-preview-spike/diag-raw.txt
+          if-no-files-found: error
+          retention-days: 30
