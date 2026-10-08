@@ -16,7 +16,7 @@ use std::path::Path;
 use std::time::Instant;
 
 use windows::core::{Interface, PCWSTR, PWSTR, GUID};
-use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{GetStockObject, UpdateWindow, WHITE_BRUSH};
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER, CLSCTX_LOCAL_SERVER,
@@ -26,9 +26,10 @@ use windows::Win32::System::Registry::{
     RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_CLASSES_ROOT, HKEY_CURRENT_USER,
     HKEY_LOCAL_MACHINE, KEY_READ, REG_SZ,
 };
+use windows::Win32::UI::Shell::PropertiesSystem::{IInitializeWithFile, IInitializeWithItem};
 use windows::Win32::UI::Shell::{
-    AssocQueryStringW, IInitializeWithFile, IInitializeWithItem, IPreviewHandler,
-    SHCreateItemFromParsingName, ASSOCF_NONE, ASSOCSTR_PROGID, ASSOCSTR_SHELLEXTENSION,
+    AssocQueryStringW, IPreviewHandler, SHCreateItemFromParsingName, ASSOCF_NONE, ASSOCSTR,
+    ASSOCSTR_PROGID, ASSOCSTR_SHELLEXTENSION,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, GetClientRect, GetMessageW, LoadCursorW,
@@ -248,20 +249,15 @@ unsafe extern "system" fn wnd_proc(
                 }
             };
 
-            let mut state = PreviewState {
+            // 注意：WM_CREATE 阶段窗口尺寸尚未确定，不在这里挂载预览。
+            // 真正的挂载放在首次 WM_SIZE（那时客户区尺寸才知道）。
+            let state = PreviewState {
                 path,
                 child: None,
                 handler: None,
                 last_error: None,
                 start: None,
             };
-            match attach_preview(hwnd, &mut state) {
-                Ok(()) => println!("\n[✓] DoPreview 已返回，窗口应已显示内容。"),
-                Err(e) => {
-                    eprintln!("\n[!] attach_preview 失败: {e}");
-                    state.last_error = Some(e);
-                }
-            }
             STATE.with(|s| *s.borrow_mut() = Some(state));
             LRESULT(0)
         }
@@ -272,35 +268,61 @@ unsafe extern "system" fn wnd_proc(
             let _ = GetClientRect(hwnd, &mut rc);
             let w = rc.right - rc.left;
             let h = rc.bottom - rc.top;
+            let ph = (h - 24).max(1);
 
-            STATE.with(|s| {
-                let mut guard = s.borrow_mut();
-                if let Some(state) = guard.as_mut() {
-                    if state.child.is_none() && state.last_error.is_none() {
-                        // 首次：此刻尺寸才确定，创建子窗口并挂处理器
-                        let _ = ensure_child_and_resize(hwnd, state, w, h - 24);
-                    } else if let Some(child) = state.child {
-                        let _ = windows::Win32::UI::WindowsAndMessaging::SetWindowPos(
-                            child,
-                            None,
-                            0,
-                            24,
-                            w,
-                            (h - 24).max(1),
-                            windows::Win32::UI::WindowsAndMessaging::SWP_NOZORDER,
-                        );
-                        if let Some(handler) = &state.handler {
-                            let r = RECT {
-                                left: 0,
-                                top: 0,
-                                right: w,
-                                bottom: (h - 24).max(1),
-                            };
-                            let _ = handler.SetRect(&r);
+            // 先判断是否需要首次挂载（锁在块内释放，避免与下方借用冲突）
+            let need_attach = STATE.with(|s| {
+                s.borrow()
+                    .as_ref()
+                    .map(|st| st.child.is_none() && st.last_error.is_none())
+                    .unwrap_or(false)
+            });
+
+            if need_attach {
+                // 首次：此刻客户区尺寸才确定。在锁外调用，打日志/COM 调用都安全。
+                let r = STATE.with(|s| {
+                    let mut guard = s.borrow_mut();
+                    let state = guard.as_mut().unwrap();
+                    ensure_child_and_resize(hwnd, state, w, ph)
+                });
+                if let Err(e) = r {
+                    eprintln!("\n[!] 挂载预览失败: {e}");
+                    STATE.with(|s| {
+                        if let Some(st) = s.borrow_mut().as_mut() {
+                            st.last_error = Some(e);
+                        }
+                    });
+                } else {
+                    println!("\n[✓] DoPreview 已返回，窗口应已显示内容。");
+                }
+            } else {
+                // 后续：随窗口缩放调整预览区域
+                STATE.with(|s| {
+                    let mut guard = s.borrow_mut();
+                    if let Some(state) = guard.as_mut() {
+                        if let Some(child) = state.child {
+                            let _ = windows::Win32::UI::WindowsAndMessaging::SetWindowPos(
+                                child,
+                                None,
+                                0,
+                                24,
+                                w.max(1),
+                                ph,
+                                windows::Win32::UI::WindowsAndMessaging::SWP_NOZORDER,
+                            );
+                            if let Some(handler) = &state.handler {
+                                let r = RECT {
+                                    left: 0,
+                                    top: 0,
+                                    right: w.max(1),
+                                    bottom: ph,
+                                };
+                                let _ = handler.SetRect(&r);
+                            }
                         }
                     }
-                }
-            });
+                });
+            }
             LRESULT(0)
         }
 
