@@ -1,0 +1,75 @@
+name: recon
+
+# SFM fork 侦察 + 集成点定位
+# 目的：在不落地源码的前提下，让 CI 拉取 SFM、确认能否编译、并产出集成点报告。
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/recon.yml'
+
+jobs:
+  recon:
+    runs-on: windows-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: 拉取上游 SFM 源码
+        shell: pwsh
+        run: |
+          # fork 刚创建时可能还是空的，直接从上游拉
+          git clone --depth 1 https://github.com/aleksey-hoffman/sigma-file-manager.git sfm
+          cd sfm
+          Write-Host "commit: $(git rev-parse HEAD)"
+          Write-Host "分支: $(git rev-parse --abbrev-ref HEAD)"
+          Write-Host "文件数: $((Get-ChildItem -Recurse -File | Measure-Object).Count)"
+
+      - name: 定位集成点
+        shell: pwsh
+        run: |
+          cd sfm
+          $report = @()
+          $report += "### 1. determineFileType 定义（唯一类型分发入口）"
+          $report += (Select-String -Path 'src/stores/runtime/quick-view.ts' -Pattern 'QuickViewFileType|_EXTENSIONS =|determineFileType' | ForEach-Object { "  L$($_.LineNumber): $($_.Line.Trim())" })
+          $report += ""
+          $report += "### 2. mediaSrc 是怎么来的（PDF/图片共用，决定能否复用 iframe）"
+          $report += (Select-String -Path 'src/modules/navigator/components/info-panel/composables/use-info-panel-image-preview.ts' -Pattern 'mediaSrc|convertFileSrc|asset|blob|url' | ForEach-Object { "  L$($_.LineNumber): $($_.Line.Trim())" })
+          $report += ""
+          $report += "### 3. Rust 命令注册位置"
+          $report += (Select-String -Path 'src-tauri/src/lib.rs' -Pattern 'invoke_handler|generate_handler|mod ' | Select-Object -First 40 | ForEach-Object { "  L$($_.LineNumber): $($_.Line.Trim())" })
+          $report += ""
+          $report += "### 4. 已有的文本预览命令（我们将仿照它新增命令）"
+          $report += (Select-String -Path 'src-tauri/src/*.rs' -Pattern 'read_text_preview|fn read_text|command\]' | Select-Object -First 30 | ForEach-Object { "  $($_.Filename) L$($_.LineNumber): $($_.Line.Trim())" })
+          $report += ""
+          $report += "### 5. 是否已有 LibreOffice / 文档转换相关代码"
+          $report += (Select-String -Path 'src-tauri/src/*.rs','src-tauri/src/**/*.rs' -Pattern 'soffice|libreoffice|convert_to|docx|xlsx' -ErrorAction SilentlyContinue | Select-Object -First 20 | ForEach-Object { "  $($_.Filename) L$($_.LineNumber): $($_.Line.Trim())" })
+          $report += ""
+          $report += "### 6. 前端依赖（是否已有 docx/office 渲染库）"
+          $report += (Select-String -Path 'package.json' -Pattern 'docx|xlsx|pptx|pdf|mammoth|office' | ForEach-Object { "  L$($_.LineNumber): $($_.Line.Trim())" })
+
+          $report | Out-File -FilePath recon-report.txt -Encoding utf8
+          $report | ForEach-Object { Write-Host $_ }
+
+      - name: 编译前端（验证基线）
+        shell: pwsh
+        run: |
+          cd sfm
+          npm ci --no-audit --no-fund
+          npm run build-only
+
+      - name: 编译 Rust 侧（验证基线，耗时较长）
+        shell: pwsh
+        timeout-minutes: 60
+        run: |
+          cd sfm/src-tauri
+          cargo build --release
+
+      - name: 上传侦察报告
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: recon-report
+          path: sfm/recon-report.txt
+          if-no-files-found: warn
+          retention-days: 14
