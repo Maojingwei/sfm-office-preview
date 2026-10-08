@@ -17,8 +17,26 @@
 | --- | --- |
 | 设计依据 | ✅ 基于 Microsoft 官方文档（预览处理器注册机制、`IPreviewHandler::SetWindow`） |
 | **编译** | ✅ **已在 GitHub Actions `windows-latest` 上编译通过**（clippy 也过） |
-| **运行** | ✅ **已实测**：`--diag` 与预览模式均在本机跑通 |
-| **视觉确认** | ⏳ **待你在本机看一眼窗口内容**（CI 无桌面，本会话无审批权限弹窗） |
+| **运行** | ✅ **已实测跑通**：CLSID 解析 → 实例化 → 初始化 → `DoPreview` 全链路成功 |
+| 视觉确认 | ⏳ 请双击桌面的 `sfm-preview-spike.exe` 看一眼（无参数时会自动找示例文档） |
+
+## 用法
+
+**最简单：双击 `sfm-preview-spike.exe`。** 无参数时它会自动在程序所在目录找一个 `.docx`
+（优先选文件名含 `spike` / `preview` / `预览` 的），找到就直接开预览窗；找不到才弹提示框。
+
+```powershell
+# 指定文件
+.\sfm-preview-spike.exe "C:\path\to\a.docx"
+
+# 只看探测结果，不开窗
+.\sfm-preview-spike.exe --diag "C:\path\to\a.docx"
+
+# 机器可读输出（单行 JSON）
+.\sfm-preview-spike.exe --diag --json "C:\path\to\a.docx"
+```
+
+> 标志位顺序无关（`--json --diag` 也有效）。
 
 ### S0 实测结论（Windows AMD64 + WPS Office 12.1.0.28505）
 
@@ -41,20 +59,8 @@
 
 ### 你需要做的最后一步
 
-下载 `sfm-preview-spike.exe`，在**装有 WPS 的 Windows** 上运行：
-
-```powershell
-# 看到窗口内容即 S0 通过
-.\sfm-preview-spike.exe "C:\path\to\any.docx"
-
-# 只看探测结果，不开窗
-.\sfm-preview-spike.exe --diag "C:\path\to\any.docx"
-
-# 机器可读输出
-.\sfm-preview-spike.exe --diag --json "C:\path\to\any.docx"
-```
-
-预期：弹出窗口并由 **WPS** 渲染出文档内容，控制台打印 `端到端耗时: xxx ms` 与 `DoPreview 已返回`。
+桌面上已放好 `sfm-preview-spike.exe`，**直接双击**即可（同目录有 `SPIKE-预览测试.docx`，会被自动选中）。
+预期：弹出窗口并由 **WPS** 渲染出文档内容。
 
 ---
 
@@ -171,6 +177,31 @@ ProgID    : WPS.Docx.6
 
 **教训**：`--diag` 的 JSON 输出模式一开始不生效、`--json --diag` 会走成预览模式，
 原因都是标志位只检查了 `args[0]`；已改为**顺序无关**判断。
+
+### 最严重的一个 bug：用 HKCR 校验 CLSID（务必别重犯）
+
+我曾加过一段"CLSID 存在性校验"，用 `HKEY_CLASSES_ROOT\CLSID\{...}` 探测键是否存在，
+想借此跳过 HKLM 里那个死值。**结果把有效的 WPS 处理器也误判成死值**，预览彻底失败：
+
+```
+[i] 跳过候选 {0C7FEF07-…}（来源 HKCU\<ext>\ShellEx）—— 该 CLSID 未在注册表中注册，属残留死值
+[!] 挂载预览失败: 该类型没有任何注册路径
+```
+
+原因（实测确认）：
+
+| 探测位置 | 结果 |
+| --- | --- |
+| `HKLM\SOFTWARE\Classes\CLSID\{0C7FEF07-…}` | ❌ 不存在（64 位视图） |
+| `HKCU\SOFTWARE\Classes\CLSID\{0C7FEF07-…}` | ❌ 不存在 |
+| **`HKLM\SOFTWARE\WOW6432Node\Classes\CLSID\{0C7FEF07-…}`** | ✅ **只有这里存在** |
+| `HKEY_CLASSES_ROOT\CLSID\{0C7FEF07-…}`（64 位进程） | ❌ **看不到 32 位视图的 CLSID** |
+
+**结论：不要用注册表探测判断 CLSID 是否可用。** 正确做法是**逐个候选尝试 `CoCreateInstance`**，
+第一个实例化成功的就是可用的——这个判据不受位数视图影响，且顺带把"死值"自然过滤掉了。
+
+另外注意：CLSID 键通常**没有默认值**（只有 `InprocServer32` / `InprocHandler32` 等子键），
+所以即使用键存在性判断，也不能用"读默认值"代替。
 
 ---
 
