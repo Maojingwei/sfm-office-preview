@@ -1,0 +1,21 @@
+# Rust 构建产物
+target/
+**/target/
+Cargo.lock
+
+# 便携工具链（本机用来推代码的 MinGit，不入库）
+.tools/
+
+# 临时与产物
+*.zip
+diag-raw.txt
+sample.docx
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+
+# Windows
+Thumbs.db
+desktop.ini
