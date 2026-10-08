@@ -48,35 +48,31 @@ const PREVIEW_HANDLERS_KEY: &str =
     r"SOFTWARE\Microsoft\Windows\CurrentVersion\PreviewHandlers";
 
 fn main() {
+    // 控制台按 UTF-8 输出，避免中文在 GBK 代码页下变乱码
+    unsafe {
+        let _ = windows::Win32::System::Console::SetConsoleOutputCP(65001);
+    }
+
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() {
         eprintln!("用法: sfm-preview-spike.exe [--diag] \"<文件路径>\"");
         std::process::exit(2);
     }
 
-    let diag_only = args[0].eq_ignore_ascii_case("--diag");
+    // 标志位与顺序无关
+    let diag_only = args.iter().any(|a| a.eq_ignore_ascii_case("--diag"));
     let json_mode = args.iter().any(|a| a.eq_ignore_ascii_case("--json"));
-    let positional: Vec<String> = args
+    // 位置参数 = 第一个不以 -- 开头且看起来像路径的项（允许路径本身以 - 开头的情况极少见）
+    let positional: Option<String> = args
         .iter()
-        .filter(|a| !a.starts_with("--"))
-        .cloned()
-        .collect();
+        .find(|a| !a.starts_with("--"))
+        .cloned();
 
-    let path = if diag_only {
-        match args.iter().skip(1).find(|a| !a.starts_with("--")) {
-            Some(p) => p.clone(),
-            None => {
-                eprintln!("--diag 需要文件路径");
-                std::process::exit(2);
-            }
-        }
-    } else {
-        match positional.first() {
-            Some(p) => p.clone(),
-            None => {
-                eprintln!("用法: sfm-preview-spike.exe [--diag] [--json] \"<文件路径>\"");
-                std::process::exit(2);
-            }
+    let path = match positional {
+        Some(p) => p,
+        None => {
+            eprintln!("用法: sfm-preview-spike.exe [--diag] [--json] \"<文件路径>\"");
+            std::process::exit(2);
         }
     };
 
@@ -86,6 +82,7 @@ fn main() {
     }
 
     if diag_only {
+        // 注意：JSON 模式必须优先判断，否则 --diag --json 会走到人类可读分支
         if json_mode {
             print_diag_json(&path);
         } else {
@@ -473,44 +470,79 @@ fn ext_of(path: &str) -> Option<String> {
 
 /// 解析某扩展名注册的预览处理器 CLSID。
 ///
-/// **注册点有三处，必须全部探测**（实测教训，逐轮修正得来）：
-///   ① HKLM\SOFTWARE\Classes\<ext>\ShellEx\{8895B1C6-…}  ← 实测中 **WPS 用的就是这个**
-///   ② HKCU\SOFTWARE\Classes\<ext>\ShellEx\{8895B1C6-…}  ← **优先级最高，会覆盖 HKLM**
+/// **注册点有三处，按优先级依次尝试**（实测教训，逐轮修正得来）：
+///   ① HKCU\SOFTWARE\Classes\<ext>\ShellEx\{8895B1C6-…}  ← **优先级最高**，实测中生效的就是它
+///   ② HKLM\SOFTWARE\Classes\<ext>\ShellEx\{8895B1C6-…}
 ///   ③ HKCR\<ext> 的 ProgID\shellex\{8895B1C6-…}        ← 传统位置（本机为空）
 ///
-/// 注意：
-/// - 生效值取 **HKCU > HKLM**。
-/// - 本机 `HKLM\<ext>\ShellEx` 指向 `{84F66100-…}`，但该 CLSID 在注册表里**根本不存在**；
-///   真正生效的是 HKCU 的 `{0C7FEF07-…}`。所以**不能只看 HKLM**。
-/// - 该 CLSID 只在 `WOW6432Node` 下注册、且只有 `InprocHandler32`（无 `InprocServer32`），
-///   意味着它是 **32 位、进程外/代理宿主** 形态（见 README「宿主策略」）。
+/// **关键实测教训**：
+/// - 本机 ② 指向 `{84F66100-…}`，但该 CLSID 在**三个注册表视图下都不存在**（Office 卸载残留的死值）。
+///   所以**不能只看 HKLM，也不能遇到第一个值就用**——必须校验 CLSID 是否真实存在，否则回退下一个候选。
+/// - 生效的 `{0C7FEF07-…}` 只在 `WOW6432Node` 下注册、且只有 `InprocHandler32`（无 `InprocServer32`），
+///   说明它是 **32 位组件**，64 位宿主必须走 `CLSCTX_LOCAL_SERVER` 代理激活。
 fn resolve_preview_clsid(path: &str) -> Result<Option<(GUID, &'static str)>, String> {
     let ext = match ext_of(path) {
         Some(e) => e,
         None => return Ok(None),
     };
 
-    // ① / ② 扩展名直属 ShellEx：HKCU 优先
     let shellex_sub = format!(r"{ext}\ShellEx\{SHELLEX_PREVIEW_HANDLER}");
+
+    // 按优先级收集候选
+    let mut candidates: Vec<(GUID, &'static str)> = Vec::new();
+
     if let Some(s) = reg_default_string_hkcu(&shellex_sub) {
         if let Some(g) = parse_guid(s.trim()) {
-            return Ok(Some((g, "HKCU\\<ext>\\ShellEx")));
+            candidates.push((g, "HKCU\\<ext>\\ShellEx"));
         }
     }
     if let Some(s) = reg_default_string_hklm_classes(&shellex_sub) {
         if let Some(g) = parse_guid(s.trim()) {
-            return Ok(Some((g, "HKLM\\Classes\\<ext>\\ShellEx")));
+            candidates.push((g, "HKLM\\Classes\\<ext>\\ShellEx"));
+        }
+    }
+    if let Ok(Some(s)) = assoc_query(&ext, ASSOCSTR_SHELLEXTENSION, SHELLEX_PREVIEW_HANDLER) {
+        if let Some(g) = parse_guid(s.trim()) {
+            candidates.push((g, "ProgID\\shellex"));
         }
     }
 
-    // ③ 传统位置：ProgID\shellex
-    if let Some(s) = assoc_query(&ext, ASSOCSTR_SHELLEXTENSION, SHELLEX_PREVIEW_HANDLER)? {
-        if let Some(g) = parse_guid(s.trim()) {
-            return Ok(Some((g, "ProgID\\shellex")));
+    // 依次校验 CLSID 是否真实注册于某个视图，返回第一个可用的
+    for (g, via) in &candidates {
+        if clsid_is_registered(g) {
+            return Ok(Some((*g, via)));
         }
+        eprintln!("[i] 跳过候选 {g:?}（来源 {via}）—— 该 CLSID 未在注册表中注册，属残留死值");
     }
 
     Ok(None)
+}
+
+/// 该 CLSID 是否在任一注册表视图下真实存在。
+///
+/// 注意：CLSID 键通常**没有默认值**（只有 `InprocServer32` 等子键），
+/// 所以必须用"键是否存在"判断，不能用"读默认值"——否则会把有效处理器误判为死值。
+fn clsid_is_registered(g: &GUID) -> bool {
+    let hkcr = format!(r"CLSID\{{{g:?}}}");
+    let wow = format!(r"WOW6432Node\Classes\CLSID\{{{g:?}}}");
+    let hkcu = format!(r"SOFTWARE\Classes\CLSID\{{{g:?}}}");
+
+    reg_key_exists(HKEY_CLASSES_ROOT, &hkcr)
+        || reg_key_exists(HKEY_LOCAL_MACHINE, &wow)
+        || reg_key_exists(HKEY_CURRENT_USER, &hkcu)
+}
+
+/// 注册表键是否存在（不读取任何值）
+fn reg_key_exists(root: HKEY, subkey: &str) -> bool {
+    let sub = wide(subkey);
+    let mut hkey = HKEY::default();
+    let rc = unsafe { RegOpenKeyExW(root, PCWSTR(sub.as_ptr()), 0, KEY_READ, &mut hkey) };
+    if rc.0 == WIN32_ERROR_SUCCESS {
+        let _ = unsafe { RegCloseKey(hkey) };
+        true
+    } else {
+        false
+    }
 }
 
 /// 取文件关联的 ProgID
