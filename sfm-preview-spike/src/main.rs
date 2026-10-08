@@ -599,7 +599,7 @@ fn reg_default_string_at(root: HKEY, subkey: &str) -> Option<String> {
         RegQueryValueExW(
             hkey,
             PCWSTR::null(),
-            std::ptr::null(),
+            None,
             Some(&mut ty),
             None,
             Some(&mut len),
@@ -615,7 +615,7 @@ fn reg_default_string_at(root: HKEY, subkey: &str) -> Option<String> {
         RegQueryValueExW(
             hkey,
             PCWSTR::null(),
-            std::ptr::null(),
+            None,
             Some(&mut ty),
             Some(buf.as_mut_ptr()),
             Some(&mut len),
