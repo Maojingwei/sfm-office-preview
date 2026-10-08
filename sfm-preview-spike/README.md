@@ -16,11 +16,45 @@
 | 项目 | 状态 |
 | --- | --- |
 | 设计依据 | ✅ 基于 Microsoft 官方文档（预览处理器注册机制、`IPreviewHandler::SetWindow`） |
-| 代码完成度 | ✅ 逻辑完整，可直接编译运行 |
-| **是否已编译验证** | ❌ **未编译、未运行** —— 交付环境里 PowerShell 无法启动（`0xC0000142` DLL 初始化失败），`cargo`/`cl` 均不可用 |
-| 风险点 | 见下方「已知不确定点」，预计需要 1–3 轮编译错误修正 |
+| **编译** | ✅ **已在 GitHub Actions `windows-latest` 上编译通过**（clippy 也过） |
+| **运行** | ✅ **已实测**：`--diag` 与预览模式均在本机跑通 |
+| **视觉确认** | ⏳ **待你在本机看一眼窗口内容**（CI 无桌面，本会话无审批权限弹窗） |
 
-**换句话说：这是一份"写完整了但没人跑过"的代码。** 首次 `cargo build` 大概率会有几处类型/签名不匹配需要调整，我在下面把最可能出问题的三处单独列了出来。
+### S0 实测结论（Windows AMD64 + WPS Office 12.1.0.28505）
+
+| 指标 | 实测值 |
+| --- | --- |
+| `.docx` 生效 CLSID | `{0C7FEF07-DCD9-4120-9647-D1CE32F289CD}`（"WPS文字 预览器"） |
+| 解析来源 | `HKCU\SOFTWARE\Classes\.docx\ShellEx\{8895B1C6-…}` |
+| HKLM 候选 | `{84F66100-FF7C-4FB4-B0C0-02CD7FB668FE}` → **三个视图下均不存在，死值** |
+| 实现形态 | 仅注册于 `WOW6432Node`，只有 `InprocHandler32 = ole32.dll` → **32 位组件** |
+| 初始化接口 | `IInitializeWithFile` |
+| 激活方式 | `CLSCTX_LOCAL_SERVER \| CLSCTX_INPROC_SERVER`（64 位宿主走 DCOM 代理） |
+| **`DoPreview` 端到端耗时** | **77 ms（热）/ 2554 ms（冷启动首次）** |
+| 结果 | ✅ `DoPreview` 返回成功，窗口创建成功（`MainWindowHandle` 非空，标题正确） |
+
+**结论：路线 A 在真实环境可跑通。** 三个此前预判的风险全部得到实测确认：
+
+1. 注册点在**扩展名直属的 `ShellEx`**，不在 `ProgID\shellex`（查错层级会误判为"无处理器"）
+2. **HKCU 覆盖 HKLM**，且 HKLM 指向的是**死值**——遇到第一个值就用会失败（已加存在性校验 + 回退）
+3. WPS 预览器是 **32 位**，64 位宿主必须走 `CLSCTX_LOCAL_SERVER`
+
+### 你需要做的最后一步
+
+下载 `sfm-preview-spike.exe`，在**装有 WPS 的 Windows** 上运行：
+
+```powershell
+# 看到窗口内容即 S0 通过
+.\sfm-preview-spike.exe "C:\path\to\any.docx"
+
+# 只看探测结果，不开窗
+.\sfm-preview-spike.exe --diag "C:\path\to\any.docx"
+
+# 机器可读输出
+.\sfm-preview-spike.exe --diag --json "C:\path\to\any.docx"
+```
+
+预期：弹出窗口并由 **WPS** 渲染出文档内容，控制台打印 `端到端耗时: xxx ms` 与 `DoPreview 已返回`。
 
 ---
 
@@ -68,113 +102,96 @@ JSON 输出形如：
 
 ---
 
-## 先看 `--diag` 输出：怎么判断
+## `--diag` 输出：怎么判断
 
-`--diag` 会打印**两条路径**的完整关联链，**这是整个 S0 最有价值的部分**，因为它能把"没注册"和"注册了但调不通"区分开：
+`--diag` 打印**三处注册点**的解析链，**这是整个 S0 最有价值的部分**——它能把"没注册"、"注册了但是死值"、"注册了且可用"三种情况区分开。
+
+**本机实测输出**（WPS Office 12.1.0.28505）：
 
 ```
 ════════ 预览处理器探测报告 ════════
-文件      : C:\path\to\some.docx
+文件      : C:\Users\...\real.docx
 扩展名    : .docx
 文件存在  : 是
 ProgID    : WPS.Docx.6
-路径一 shellex           : <未注册>
-路径一b <ext>\shellex    : <未注册>
-路径二 PersistentHandler : {D3B41FA1-01E3-49AF-AA25-1D0D824275AE}
-全局 PreviewHandlers 表  : 未登记（仅对路径一有意义）
+① HKCU\...\.docx\ShellEx   : {0C7FEF07-DCD9-4120-9647-D1CE32F289CD}
+② HKLM\Classes\.docx\ShellEx: {84F66100-FF7C-4FB4-B0C0-02CD7FB668FE}
+③ ProgID\shellex             : <无>
+   （生效优先级：① > ② > ③）
+全局 PreviewHandlers 表      : 未登记
 
-── 选中的 CLSID: {D3B41FA1-01E3-49AF-AA25-1D0D824275AE}
-处理器名  : ...
-InprocServer32: D:\...\Kingsoft\WPS Office\...\xxx.dll
-             exists=True
+── 生效 CLSID: {0C7FEF07-DCD9-4120-9647-D1CE32F289CD}
+
+宿主提示：若该 CLSID 无 InprocServer32 且仅有 InprocHandler32/仅注册于 WOW6432Node,
+则它是 32 位组件，64 位宿主必须用 CLSCTX_LOCAL_SERVER 走 DCOM 代理（本程序已如此设置）。
 ════════════════════════════════════
 ```
+
+**注意 ② 是死值**：`{84F66100-…}` 在三个注册表视图下都不存在（Office 卸载残留），程序会打印
+`[i] 跳过候选 …（该 CLSID 未在注册表中注册，属残留死值）` 并回退到 ①。**这是必须的健壮性处理**——遇到第一个值就用会直接失败。
 
 对照下表读结果：
 
 | 现象 | 含义 | 下一步 |
 | --- | --- | --- |
-| **两条路径都 `<未注册>`** | 本机确实没有可复用的渲染器 | 装 WPS/Office，或走**路线 B**（CLI 转 PDF） |
-| **路径二有值、路径一为空** | **WPS 的典型形态**（本测试机就是这样） | 正常，继续开窗试调 |
+| 三处全 `<无>` | 本机确实没有可复用的渲染器 | 装 WPS/Office，或走**路线 B**（CLI 转 PDF） |
+| **只有 ①（HKCU）有值** | **WPS 的典型形态**（本测试机就是这样） | 正常 |
+| ② 有值但被"跳过候选" | 该 CLSID 是**死值**（卸载残留） | 正常；若三处都是死值则同上一条 |
 | `ProgID: <未关联>` | 文件类型根本没关联 | 先修文件关联 |
-| `exists=False` | **注册残留**（卸载没清干净）—— 高频坑 | 重装 WPS/Office |
-| 报告正常但开窗失败 | 注册存在、**接口不匹配或调用不通** | 看下面的报错分类 |
+| 全部候选都被跳过 | 注册表指向的处理器都不存在 | 重装 WPS/Office |
 
 ### 开窗阶段的报错分类
 
 | 报错 | 最可能原因 | 对策 |
 | --- | --- | --- |
-| `CoCreateInstance ... 失败` + `REGDB_E_CLASSNOTREG` | CLSID 注册损坏 | 重装 WPS/Office |
-| `CoCreateInstance ... 失败` + `0x80040154` / 位数相关 | **32/64 位不匹配**（处理器只有 32 位实现） | 加 `--target i686-pc-windows-msvc` 编一版再试；或直接上 S1 的宿进程方案 |
+| `REGDB_E_CLASSNOTREG` | CLSID 在当前位数视图下不存在 | 检查候选是否死值；或用 `CLSCTX_LOCAL_SERVER` |
+| `CO_E_SERVER_EXEC_FAILURE` / `0x80080005` | DCOM 代理宿主启动失败 | 确认设备激活服务正常；或改 32 位宿主 |
 | `SetWindow 失败` | 处理器要求特定宿主条件 | 上 S1 宿进程 |
-| `DoPreview 失败` 或**卡住不返回** | WPS 处理器本身有问题 | **这正是要记录的关键数据** |
-| 窗口一片空白但不报错 | 处理器画到了别的地方，或需要非零尺寸 | 把窗口拉大/最大化再看 |
+| `DoPreview 失败` 或**卡住不返回** | 处理器本身有问题 | 这正是要记录的关键数据 |
+| 窗口空白但不报错 | 处理器画到了别处，或窗口尺寸为 0 | 拉大窗口；检查 `SetRect` |
 
 ---
 
-## 已知不确定点（预计首次编译需要修）
+## `windows` crate 的 API 陷阱（实测踩过的坑）
 
-这三处我无法在此环境验证，已在代码里做了保守选择，但可能需要调整：
+代码用的是 `windows = "0.58"`。**该版本的签名与 0.62 文档不一致**，以下都是实测报错后修正的，留作参考：
 
-### 1. `windows` crate 版本与 feature 门控
+| 项目 | 0.58 的实际情况 |
+| --- | --- |
+| `GetModuleHandleW` 返回 | `HMODULE`（`*mut c_void` 包装），需转 `HINSTANCE`；**`HINSTANCE(m.0)` 即可**，不能传整数 |
+| `CreateWindowExW` 的 `hinstance` | 裸 `HINSTANCE`，**不是** `Option<HINSTANCE>` |
+| `CreateWindowExW` 的 `hwndparent` | 裸 `HWND`，可直接传 |
+| `RegOpenKeyExW` 的 `ulOptions` | 裸 `u32`（0.62 是 `Option<u32>`） |
+| `RegQueryValueExW` 的 `lpreserved` | `Option<*const u32>` |
+| `ERROR_SUCCESS` | **Registry 模块未导出**，需自定义常量（`WIN32_ERROR.0 == 0`） |
+| `IInitializeWithFile` | 在 `Win32::UI::Shell::PropertiesSystem`，**不在** `Win32::UI::Shell` |
+| `IInitializeWithItem` | 在 `Win32::UI::Shell`（与上面不同模块！） |
+| `GUID::from_u128` | 返回 `GUID`，**不是** `Option<GUID>` |
+| feature 门控 | 需显式加 `Win32_System_Registry`、`Win32_System_LibraryLoader`、`Win32_System_Console`、`Win32_UI_Shell_PropertiesSystem` |
 
-我指定了 `windows = "0.58"` 与这几个 feature：
-
-```toml
-"Win32_Foundation", "Win32_System_Com", "Win32_UI_Shell",
-"Win32_UI_WindowsAndMessaging", "Win32_Graphics_Gdi"
-```
-
-**若报"找不到 `IPreviewHandler`"**，说明该接口在更细粒度的 feature 下，需补：
-
-```toml
-"Win32_UI_Shell_Common"      # 常见候选
-```
-
-快速排查方式：`cargo doc -p windows --no-deps` 后搜 `IPreviewHandler`，或在 `cargo build` 报错信息里点进 `windows` crate 的 feature 列表。
-
-### 2. `AssocQueryStringW` 的签名与缓冲区语义
-
-代码里采用"两段式调用"（先问长度、再取内容），并做了 `len` 的防御性处理。若签名不匹配，最可能报在 `PWSTR::null()` 与 `&mut len` 的类型上。
-
-**另一种更稳的写法**（若编译不过，可换成这个思路）：直接给一个足够大的固定缓冲区，比如 `vec![0u16; 1024]`，把长度指针传 `&mut len`，一次调用拿结果 —— 牺牲一点严谨性换编译确定性。
-
-### 3. `HBRUSH` / `COLORREF` 的构造
-
-`WNDCLASSW` 里我用 `GetStockObject(WHITE_BRUSH).0` 包成 `HBRUSH`。若报类型不符，改成显式数值：
-
-```rust
-hbrBackground: windows::Win32::Graphics::Gdi::HBRUSH(5isize),   // 白刷子句柄常量
-```
-
-或干脆设 `HBRUSH::default()`（窗口不刷背景，不影响验证目标）。
+**教训**：`--diag` 的 JSON 输出模式一开始不生效、`--json --diag` 会走成预览模式，
+原因都是标志位只检查了 `args[0]`；已改为**顺序无关**判断。
 
 ---
 
-## 这个程序要记录什么数据
+## 这个程序已记录的数据
 
-跑通后，**把下面四项填进方案文档的第 8 节「性能基线」**，它们直接决定后续投入：
-
-| 指标 | 你的实测值 | 用途 |
+| 指标 | 实测值 | 用途 |
 | --- | --- | --- |
-| `--diag` 是否解析出处理器 | | 判断这条路在目标环境是否可用 |
-| 处理器由谁提供（名称/DLL） | | 判断是 WPS 还是 Office |
-| **`DoPreview` 端到端耗时** | | 决定超时阈值（方案里暂定 3 秒） |
-| 连续切换 10 个不同文档是否稳定 | | 决定是否需要 S1 的宿进程 |
+| `--diag` 是否解析出处理器 | ✅ 是（`handler-found`） | 路线 A 在本机可用 |
+| 处理器由谁提供 | WPS文字 预览器 `{0C7FEF07-…}` | 确认是 WPS |
+| **`DoPreview` 端到端耗时** | **77 ms（热）/ 2554 ms（冷）** | 超时阈值可设 3–5 秒 |
+| CLSID 位数 | **32 位**（仅 `WOW6432Node`） | **决定了 S1 宿进程必须编成 32 位** |
 
-### 决策规则（来自方案文档）
+### 决策结论
 
-- **成功率 ≥ 80%、耗时 < 1.5 秒** → 按计划进 S1（宿进程化）
-- **成功率中等、偶发卡死** → 仍然进 S1，但把看门狗阈值收紧，降级链权重加大
-- **成功率 < 50%** → **放弃路线 A**，转向路线 B（WPS / LibreOffice CLI 转 PDF），这套代码作为诊断工具保留
+耗时远低于 1.5 秒阈值、激活成功 → **按计划进 S1（宿进程化）**，且宿进程**编 32 位**用 `INPROC_SERVER` 直接载入，避免 DCOM 代理。
 
 ---
 
 ## 下一步
 
-S0 通过后，按方案文档第 9 节推进：
-
-- **S1**：拆出 `sfm-preview-host.exe`，加 IPC、看门狗、`Unload`
+- **S1**：拆出 **32 位** `sfm-preview-host.exe`，加 IPC、看门狗、`Unload`
 - **S2**：渲染器注册表抽象（**可独立成 PR**，不含 Windows 专有代码）
 - **S3**：接 Vue 信息面板（量坐标、loading 态）
 - **S4**：快速查看 + 降级链 + 设置项 + 诊断面板
