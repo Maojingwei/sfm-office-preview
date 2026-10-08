@@ -53,7 +53,40 @@ fn main() {
         let _ = windows::Win32::System::Console::SetConsoleOutputCP(65001);
     }
 
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+
+    // 无参数时的友好处理（双击运行的情形）。
+    // 注意：控制台窗口在进程退出时会立即关闭，所以这里用对话框提示，而不是只打印到 stderr。
+    if args.is_empty() {
+        match guess_launch_file() {
+            Some(p) => {
+                println!("[i] 未提供参数，自动使用: {p}");
+                args.push(p);
+            }
+            None => {
+                let msg = wide(
+                    "用法：把 .docx 文件拖到本程序图标上，或在命令行给出路径。\n\n\
+                     示例：\n\
+                     sfm-preview-spike.exe \"C:\\\\path\\\\to\\\\a.docx\"\n\
+                     sfm-preview-spike.exe --diag \"C:\\\\path\\\\to\\\\a.docx\"\n\n\
+                     本程序是 S0 验证工具：宿主化系统已注册的 WPS/Office 预览处理器。",
+                );
+                let title = wide("sfm-preview-spike — 需要文件路径参数");
+                unsafe {
+                    windows::Win32::UI::WindowsAndMessaging::MessageBoxW(
+                        None,
+                        PCWSTR(msg.as_ptr()),
+                        PCWSTR(title.as_ptr()),
+                        windows::Win32::UI::WindowsAndMessaging::MB_OK
+                            | windows::Win32::UI::WindowsAndMessaging::MB_ICONINFORMATION,
+                    );
+                }
+                std::process::exit(2);
+            }
+        }
+    }
+
+    let args: Vec<String> = args;
     if args.is_empty() {
         eprintln!("用法: sfm-preview-spike.exe [--diag] \"<文件路径>\"");
         std::process::exit(2);
@@ -384,25 +417,42 @@ fn ensure_child_and_resize(
 
     state.child = Some(child);
 
-    // 解析 + 创建处理器
-    let (clsid, via) = resolve_preview_clsid(&state.path)?
-        .ok_or_else(|| "该类型没有任何注册路径（shellex 与 PersistentHandler 均为空）".to_string())?;
-    println!("[i] CLSID 来源: {via}");
+    // 逐个尝试候选 CLSID，第一个能实例化的就用。
+    // 判据是"能否 CoCreateInstance 成功"，而不是"注册表里有没有"——
+    // 前者对本机 32 位视图下的 WPS 处理器是正确的（后者因为 HKCR 看不到 WOW6432Node 会误判）。
+    let candidates = collect_preview_clsid_candidates(&state.path);
+    if candidates.is_empty() {
+        return Err("该类型没有任何注册路径（HKCU/HKLM 的 ShellEx 与 ProgID\\shellex 均为空）".into());
+    }
+
+    println!("[i] 候选处理器 {} 个", candidates.len());
 
     let start = Instant::now();
-    // 关键：用 LOCAL_SERVER。WPS 预览器是 32 位组件（仅注册于 WOW6432Node、只有 InprocHandler32），
-    // 64 位宿主用 INPROC_SERVER 必然失败，必须让 DCOM 走代理宿主（如 SysWOW64\prevhost.exe）。
-    // 同时保留 INPROC_SERVER 作为 64 位处理器的回退。
-    let handler: IPreviewHandler = unsafe {
-        CoCreateInstance(&clsid, None, CLSCTX_LOCAL_SERVER | CLSCTX_INPROC_SERVER)
+    let mut handler_opt: Option<IPreviewHandler> = None;
+    let mut last_err = String::new();
+
+    for (clsid, via) in &candidates {
+        // 关键：用 LOCAL_SERVER。WPS 预览器是 32 位组件（仅注册于 WOW6432Node、只有 InprocHandler32），
+        // 64 位宿主用 INPROC_SERVER 必然失败，必须让 DCOM 走代理宿主（如 SysWOW64\prevhost.exe）。
+        // 同时保留 INPROC_SERVER 作为 64 位处理器的回退。
+        match unsafe { CoCreateInstance(clsid, None, CLSCTX_LOCAL_SERVER | CLSCTX_INPROC_SERVER) } {
+            Ok(h) => {
+                println!("[i] CLSID 来源: {via}  ->  {clsid:?}");
+                handler_opt = Some(h);
+                break;
+            }
+            Err(e) => {
+                eprintln!("[i] 候选 {clsid:?}（来源 {via}）实例化失败: {e:?}，尝试下一个");
+                last_err = format!(
+                    "全部候选均实例化失败，最后一个错误: {e:?}\n\
+                     若为 REGDB_E_CLASSNOTREG：该 CLSID 在对应位数视图下不存在。\n\
+                     若为 CO_E_SERVER_EXEC_FAILURE / 0x80080005：DCOM 代理宿主启动失败。"
+                );
+            }
+        }
     }
-    .map_err(|e| {
-        format!(
-            "CoCreateInstance({clsid:?}) 失败: {e:?}\n\
-             若为 REGDB_E_CLASSNOTREG：该 CLSID 在当前位数视图下不存在（32/64 位不匹配）。\n\
-             若为 CO_E_SERVER_EXEC_FAILURE / 0x80080005：代理宿主启动失败。"
-        )
-    })?;
+
+    let handler = handler_opt.ok_or(last_err)?;
 
     // 初始化数据源：先试 IInitializeWithFile，失败再试 IInitializeWithItem
     let abs = absolute_path(&state.path);
@@ -468,7 +518,7 @@ fn ext_of(path: &str) -> Option<String> {
         .map(|e| format!(".{}", e.to_string_lossy().to_lowercase()))
 }
 
-/// 解析某扩展名注册的预览处理器 CLSID。
+/// 收集某扩展名的预览处理器候选（按优先级）。
 ///
 /// **注册点有三处，按优先级依次尝试**（实测教训，逐轮修正得来）：
 ///   ① HKCU\SOFTWARE\Classes\<ext>\ShellEx\{8895B1C6-…}  ← **优先级最高**，实测中生效的就是它
@@ -476,19 +526,19 @@ fn ext_of(path: &str) -> Option<String> {
 ///   ③ HKCR\<ext> 的 ProgID\shellex\{8895B1C6-…}        ← 传统位置（本机为空）
 ///
 /// **关键实测教训**：
-/// - 本机 ② 指向 `{84F66100-…}`，但该 CLSID 在**三个注册表视图下都不存在**（Office 卸载残留的死值）。
-///   所以**不能只看 HKLM，也不能遇到第一个值就用**——必须校验 CLSID 是否真实存在，否则回退下一个候选。
-/// - 生效的 `{0C7FEF07-…}` 只在 `WOW6432Node` 下注册、且只有 `InprocHandler32`（无 `InprocServer32`），
-///   说明它是 **32 位组件**，64 位宿主必须走 `CLSCTX_LOCAL_SERVER` 代理激活。
-fn resolve_preview_clsid(path: &str) -> Result<Option<(GUID, &'static str)>, String> {
+/// - 本机 ② 指向 `{84F66100-…}`，该 CLSID **在三个注册表视图下都不存在**（Office 卸载残留的死值）。
+///   所以不能遇到第一个值就用——但**判据不是"注册表里有没有"，而是"能不能实例化"**（见下）。
+/// - 生效的 `{0C7FEF07-…}` 只在 `WOW6432Node` 下注册、只有 `InprocHandler32`（无 `InprocServer32`），
+///   是 **32 位组件**，64 位宿主必须走 `CLSCTX_LOCAL_SERVER` 代理激活。
+/// - **不能用 HKCR 探测做校验**：32 位视图下的 CLSID，64 位进程的 `HKEY_CLASSES_ROOT` 看不到，
+///   会把有效的 WPS 处理器误判成死值（这个 bug 实际发生过）。
+fn collect_preview_clsid_candidates(path: &str) -> Vec<(GUID, &'static str)> {
     let ext = match ext_of(path) {
         Some(e) => e,
-        None => return Ok(None),
+        None => return Vec::new(),
     };
 
     let shellex_sub = format!(r"{ext}\ShellEx\{SHELLEX_PREVIEW_HANDLER}");
-
-    // 按优先级收集候选
     let mut candidates: Vec<(GUID, &'static str)> = Vec::new();
 
     if let Some(s) = reg_default_string_hkcu(&shellex_sub) {
@@ -507,42 +557,7 @@ fn resolve_preview_clsid(path: &str) -> Result<Option<(GUID, &'static str)>, Str
         }
     }
 
-    // 依次校验 CLSID 是否真实注册于某个视图，返回第一个可用的
-    for (g, via) in &candidates {
-        if clsid_is_registered(g) {
-            return Ok(Some((*g, via)));
-        }
-        eprintln!("[i] 跳过候选 {g:?}（来源 {via}）—— 该 CLSID 未在注册表中注册，属残留死值");
-    }
-
-    Ok(None)
-}
-
-/// 该 CLSID 是否在任一注册表视图下真实存在。
-///
-/// 注意：CLSID 键通常**没有默认值**（只有 `InprocServer32` 等子键），
-/// 所以必须用"键是否存在"判断，不能用"读默认值"——否则会把有效处理器误判为死值。
-fn clsid_is_registered(g: &GUID) -> bool {
-    let hkcr = format!(r"CLSID\{{{g:?}}}");
-    let wow = format!(r"WOW6432Node\Classes\CLSID\{{{g:?}}}");
-    let hkcu = format!(r"SOFTWARE\Classes\CLSID\{{{g:?}}}");
-
-    reg_key_exists(HKEY_CLASSES_ROOT, &hkcr)
-        || reg_key_exists(HKEY_LOCAL_MACHINE, &wow)
-        || reg_key_exists(HKEY_CURRENT_USER, &hkcu)
-}
-
-/// 注册表键是否存在（不读取任何值）
-fn reg_key_exists(root: HKEY, subkey: &str) -> bool {
-    let sub = wide(subkey);
-    let mut hkey = HKEY::default();
-    let rc = unsafe { RegOpenKeyExW(root, PCWSTR(sub.as_ptr()), 0, KEY_READ, &mut hkey) };
-    if rc.0 == WIN32_ERROR_SUCCESS {
-        let _ = unsafe { RegCloseKey(hkey) };
-        true
-    } else {
-        false
-    }
+    candidates
 }
 
 /// 取文件关联的 ProgID
@@ -816,6 +831,40 @@ fn wide(s: &str) -> Vec<u16> {
 /// windows 0.58 里这两个句柄都是 `*mut c_void` 包装，可直接取内部指针转换。
 fn hinst_instance(m: windows::Win32::Foundation::HMODULE) -> windows::Win32::Foundation::HINSTANCE {
     windows::Win32::Foundation::HINSTANCE(m.0)
+}
+
+/// 无参数启动时，试着找一个可用的示例文档：
+///   1) 程序所在目录（放桌面上时就是桌面）
+///   2) 当前工作目录
+/// 都找不到则返回 None，由调用方弹提示框。
+fn guess_launch_file() -> Option<String> {
+    let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(d) = exe.parent() {
+            dirs.push(d.to_path_buf());
+        }
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        dirs.push(cwd);
+    }
+
+    for d in dirs {
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_file()
+                && p.extension()
+                    .map(|x| x.eq_ignore_ascii_case("docx"))
+                    .unwrap_or(false)
+            {
+                return Some(p.to_string_lossy().to_string());
+            }
+        }
+    }
+    None
 }
 
 /// 注册表 API 成功的错误码（windows 0.58 未在 Registry 模块导出，故自定义）
