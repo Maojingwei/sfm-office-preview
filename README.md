@@ -2,21 +2,34 @@
 
 围绕 [Sigma File Manager](https://github.com/aleksey-hoffman/sigma-file-manager) 能否预览 Word / Excel / PPT 的可行性研究，以及复用 Windows 系统预览处理器（WPS / Office）的技术验证。
 
+## 状态：S0 已跑通 ✅
+
+`sfm-preview-spike` **已在 GitHub Actions 编译通过并在真机实测成功**——外部程序能够宿主化 WPS 的预览处理器，`DoPreview` 返回成功，窗口正确创建。
+
+| 指标 | 实测值 |
+| --- | --- |
+| 生效 CLSID | `{0C7FEF07-DCD9-4120-9647-D1CE32F289CD}`（"WPS文字 预览器"） |
+| 解析来源 | `HKCU\SOFTWARE\Classes\.docx\ShellEx\{8895B1C6-…}` |
+| HKLM 候选 | `{84F66100-…}` → **死值**（三个注册表视图下均不存在） |
+| 处理器位数 | **32 位**（仅 `WOW6432Node`，只有 `InprocHandler32`） |
+| 激活方式 | `CLSCTX_LOCAL_SERVER \| CLSCTX_INPROC_SERVER` |
+| `DoPreview` 耗时 | **77 ms（热）/ 2554 ms（冷）** |
+
 ## 结论摘要
 
-Sigma File Manager v2.2.0 **不支持** `.docx` / `.xlsx` / `.pptx` 预览（信息面板只显示图标占位）。本文研究的是**能否复用系统里已注册的 WPS/Office 预览器**来补上这个能力。
+Sigma File Manager v2.2.0 **不支持** `.docx` / `.xlsx` / `.pptx` 预览（信息面板只显示图标占位）。本文研究的是**能否复用系统里已注册的 WPS/Office 预览器**来补上这个能力——**答案是能**。
 
-**关键实测结论**（Windows AMD64 + WPS Office 12.1.0.28505）：
+**三个关键实测发现**：
 
 | 发现 | 内容 |
 | --- | --- |
-| 注册位置 | 预览器注册在 **扩展名直属的 `ShellEx`** 下，**不在 `ProgID\shellex`** 下 |
-| 优先级 | **HKCU 覆盖 HKLM**；本机 `HKLM\.docx\ShellEx` 指向的 CLSID **根本不存在**（死值） |
-| 真正的处理器 | `{0C7FEF07-…}` WPS文字 / `{E260F96C-…}` WPS表格 / `{A1BBCFD9-…}` WPS演示 |
+| 注册位置 | 预览器注册在 **扩展名直属的 `ShellEx`** 下，**不在 `ProgID\shellex`** 下。查错层级会误判为"无处理器" |
+| 优先级 | **HKCU 覆盖 HKLM**，且本机 HKLM 指向的是**死值**——遇到第一个值就用必然失败，必须做存在性校验 + 回退 |
 | **位数** | WPS 预览器**只注册在 `WOW6432Node`（32 位）**，无 `InprocServer32`，仅 `InprocHandler32 = ole32.dll` |
-| 接口 | 推断为标准 `IPreviewHandler`（全局表命名格式与系统其它预览器一致） |
 
-→ **64 位宿主必须走 `CLSCTX_LOCAL_SERVER`（DCOM 代理）；宿进程编成 32 位才能直接 `INPROC_SERVER` 载入。**
+→ **64 位宿主必须走 `CLSCTX_LOCAL_SERVER`（DCOM 代理）；S1 宿进程应编成 32 位**，用 `INPROC_SERVER` 直接载入。
+
+另注：`<ext>\PersistentHandler` 是**搜索索引用的文本提取处理器**，**不是预览处理器**——研究过程中曾误判，已纠正。
 
 ## 目录结构
 
@@ -27,7 +40,7 @@ Sigma File Manager v2.2.0 **不支持** `.docx` / `.xlsx` / `.pptx` 预览（信
 ├── sfm-preview-spike/                         # S0 验证程序（Rust）
 │   ├── src/main.rs
 │   ├── Cargo.toml
-│   └── README.md
+│   └── README.md                              # 含实测数据与 windows crate API 陷阱清单
 └── .github/workflows/build.yml                # 云端编译（windows-latest 自带 Rust+MSVC）
 ```
 
