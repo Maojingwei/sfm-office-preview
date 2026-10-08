@@ -23,8 +23,8 @@ use windows::Win32::System::Com::{
     COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE,
 };
 use windows::Win32::System::Registry::{
-    RegCloseKey, RegOpenKeyExW, RegQueryValueExW, ERROR_SUCCESS, HKEY, HKEY_CLASSES_ROOT,
-    HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, REG_SZ,
+    RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_CLASSES_ROOT, HKEY_CURRENT_USER,
+    HKEY_LOCAL_MACHINE, KEY_READ, REG_SZ,
 };
 use windows::Win32::UI::Shell::PropertiesSystem::IInitializeWithFile;
 use windows::Win32::UI::Shell::{
@@ -201,7 +201,7 @@ fn run_window_and_preview(path: &str) -> Result<(), String> {
             700,
             None,
             None,
-            Some(hinst_instance(hinst)),
+            hinst_instance(hinst),
             Some(param as *const _),
         )
         .map_err(|e| format!("CreateWindowExW: {e:?}"))?;
@@ -379,7 +379,7 @@ fn ensure_child_and_resize(
             h.max(1),
             parent,
             None,
-            Some(hinst_instance(hinst)),
+            hinst_instance(hinst),
             None,
         )
     }
@@ -586,26 +586,26 @@ fn reg_default_string_hklm_classes(subkey: &str) -> Option<String> {
 fn reg_default_string_at(root: HKEY, subkey: &str) -> Option<String> {
     let sub = wide(subkey);
     let mut hkey = HKEY::default();
-    // ulOptions 是 Option<u32>，必须显式给 Some(0)（None 会被推断为 None::<u32> 之外的歧义）
-    let rc = unsafe { RegOpenKeyExW(root, PCWSTR(sub.as_ptr()), Some(0), KEY_READ, &mut hkey) };
-    if rc != ERROR_SUCCESS {
+    // windows 0.58: ulOptions 是裸 u32
+    let rc = unsafe { RegOpenKeyExW(root, PCWSTR(sub.as_ptr()), 0, KEY_READ, &mut hkey) };
+    if rc.0 != WIN32_ERROR_SUCCESS {
         return None;
     }
 
     let mut ty = REG_SZ;
     let mut len: u32 = 0;
-    // 先问长度：预期返回 ERROR_SUCCESS；某些情况返回 ERROR_MORE_DATA(234)
+    // 先问长度
     let rc = unsafe {
         RegQueryValueExW(
             hkey,
             PCWSTR::null(),
-            None,
+            std::ptr::null(),
             Some(&mut ty),
             None,
             Some(&mut len),
         )
     };
-    if rc != ERROR_SUCCESS || len == 0 {
+    if rc.0 != WIN32_ERROR_SUCCESS || len == 0 {
         let _ = unsafe { RegCloseKey(hkey) };
         return None;
     }
@@ -615,14 +615,14 @@ fn reg_default_string_at(root: HKEY, subkey: &str) -> Option<String> {
         RegQueryValueExW(
             hkey,
             PCWSTR::null(),
-            None,
+            std::ptr::null(),
             Some(&mut ty),
             Some(buf.as_mut_ptr()),
             Some(&mut len),
         )
     };
     let _ = unsafe { RegCloseKey(hkey) };
-    if rc != ERROR_SUCCESS {
+    if rc.0 != WIN32_ERROR_SUCCESS {
         return None;
     }
 
@@ -781,17 +781,13 @@ fn wide(s: &str) -> Vec<u16> {
 }
 
 /// `GetModuleHandleW` 返回 `HMODULE`，而 `CreateWindowExW` 要 `HINSTANCE`。
-/// windows crate 里二者是不同类型，需要显式按指针宽度转换。
+/// windows 0.58 里这两个句柄都是 `*mut c_void` 包装，可直接取内部指针转换。
 fn hinst_instance(m: windows::Win32::Foundation::HMODULE) -> windows::Win32::Foundation::HINSTANCE {
-    #[cfg(target_pointer_width = "64")]
-    {
-        windows::Win32::Foundation::HINSTANCE(m.0 as i64)
-    }
-    #[cfg(target_pointer_width = "32")]
-    {
-        windows::Win32::Foundation::HINSTANCE(m.0 as i32)
-    }
+    windows::Win32::Foundation::HINSTANCE(m.0)
 }
+
+/// 注册表 API 成功的错误码（windows 0.58 未在 Registry 模块导出，故自定义）
+const WIN32_ERROR_SUCCESS: u32 = 0;
 
 fn absolute_path(p: &str) -> String {
     match std::fs::canonicalize(p) {
