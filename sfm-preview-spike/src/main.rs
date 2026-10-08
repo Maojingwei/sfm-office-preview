@@ -853,16 +853,35 @@ fn guess_launch_file() -> Option<String> {
         let Ok(entries) = std::fs::read_dir(&d) else {
             continue;
         };
-        for e in entries.flatten() {
-            let p = e.path();
-            if p.is_file()
-                && p.extension()
-                    .map(|x| x.eq_ignore_ascii_case("docx"))
-                    .unwrap_or(false)
-            {
-                return Some(p.to_string_lossy().to_string());
-            }
+
+        let mut docx: Vec<std::path::PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.is_file()
+                    && p.extension()
+                        .map(|x| x.eq_ignore_ascii_case("docx"))
+                        .unwrap_or(false)
+            })
+            .collect();
+
+        if docx.is_empty() {
+            continue;
         }
+        docx.sort();
+
+        // 优先挑名字里带 spike / preview / 预览 的（本工具的示例文档），
+        // 免得桌面上文档很多时随机挑一个，演示结果不确定。
+        let preferred = docx.iter().find(|p| {
+            let n = p
+                .file_name()
+                .map(|x| x.to_string_lossy().to_lowercase())
+                .unwrap_or_default();
+            n.contains("spike") || n.contains("preview") || n.contains("预览")
+        });
+
+        let chosen = preferred.unwrap_or(&docx[0]);
+        return Some(chosen.to_string_lossy().to_string());
     }
     None
 }
