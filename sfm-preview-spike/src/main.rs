@@ -23,13 +23,13 @@ use windows::Win32::System::Com::{
     COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE,
 };
 use windows::Win32::System::Registry::{
-    RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_CLASSES_ROOT, HKEY_CURRENT_USER,
-    HKEY_LOCAL_MACHINE, KEY_READ, REG_SZ,
+    RegCloseKey, RegOpenKeyExW, RegQueryValueExW, ERROR_SUCCESS, HKEY, HKEY_CLASSES_ROOT,
+    HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, REG_SZ,
 };
-use windows::Win32::UI::Shell::PropertiesSystem::{IInitializeWithFile, IInitializeWithItem};
+use windows::Win32::UI::Shell::PropertiesSystem::IInitializeWithFile;
 use windows::Win32::UI::Shell::{
-    AssocQueryStringW, IPreviewHandler, SHCreateItemFromParsingName, ASSOCF_NONE, ASSOCSTR,
-    ASSOCSTR_PROGID, ASSOCSTR_SHELLEXTENSION,
+    AssocQueryStringW, IInitializeWithItem, IPreviewHandler, SHCreateItemFromParsingName,
+    ASSOCF_NONE, ASSOCSTR, ASSOCSTR_PROGID, ASSOCSTR_SHELLEXTENSION,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, GetClientRect, GetMessageW, LoadCursorW,
@@ -201,7 +201,7 @@ fn run_window_and_preview(path: &str) -> Result<(), String> {
             700,
             None,
             None,
-            Some(hinst.into()),
+            Some(hinst_instance(hinst)),
             Some(param as *const _),
         )
         .map_err(|e| format!("CreateWindowExW: {e:?}"))?;
@@ -377,9 +377,9 @@ fn ensure_child_and_resize(
             24,
             w.max(1),
             h.max(1),
-            Some(parent),
+            parent,
             None,
-            Some(hinst.into()),
+            Some(hinst_instance(hinst)),
             None,
         )
     }
@@ -586,13 +586,15 @@ fn reg_default_string_hklm_classes(subkey: &str) -> Option<String> {
 fn reg_default_string_at(root: HKEY, subkey: &str) -> Option<String> {
     let sub = wide(subkey);
     let mut hkey = HKEY::default();
-    let rc = unsafe { RegOpenKeyExW(root, PCWSTR(sub.as_ptr()), None, KEY_READ, &mut hkey) };
-    if rc.is_err() {
+    // ulOptions 是 Option<u32>，必须显式给 Some(0)（None 会被推断为 None::<u32> 之外的歧义）
+    let rc = unsafe { RegOpenKeyExW(root, PCWSTR(sub.as_ptr()), Some(0), KEY_READ, &mut hkey) };
+    if rc != ERROR_SUCCESS {
         return None;
     }
 
     let mut ty = REG_SZ;
     let mut len: u32 = 0;
+    // 先问长度：预期返回 ERROR_SUCCESS；某些情况返回 ERROR_MORE_DATA(234)
     let rc = unsafe {
         RegQueryValueExW(
             hkey,
@@ -603,7 +605,7 @@ fn reg_default_string_at(root: HKEY, subkey: &str) -> Option<String> {
             Some(&mut len),
         )
     };
-    if rc.is_err() || len == 0 {
+    if rc != ERROR_SUCCESS || len == 0 {
         let _ = unsafe { RegCloseKey(hkey) };
         return None;
     }
@@ -620,7 +622,7 @@ fn reg_default_string_at(root: HKEY, subkey: &str) -> Option<String> {
         )
     };
     let _ = unsafe { RegCloseKey(hkey) };
-    if rc.is_err() {
+    if rc != ERROR_SUCCESS {
         return None;
     }
 
@@ -634,7 +636,11 @@ fn reg_default_string_at(root: HKEY, subkey: &str) -> Option<String> {
 
 fn parse_guid(s: &str) -> Option<GUID> {
     let t = s.trim().trim_start_matches('{').trim_end_matches('}');
-    GUID::from_u128(u128::from_str_radix(&t.replace('-', ""), 16).ok()?)
+    let hex = t.replace('-', "");
+    if hex.len() != 32 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    u128::from_str_radix(&hex, 16).ok().map(GUID::from_u128)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -772,6 +778,19 @@ fn clean_dll_path(raw: &str) -> String {
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// `GetModuleHandleW` 返回 `HMODULE`，而 `CreateWindowExW` 要 `HINSTANCE`。
+/// windows crate 里二者是不同类型，需要显式按指针宽度转换。
+fn hinst_instance(m: windows::Win32::Foundation::HMODULE) -> windows::Win32::Foundation::HINSTANCE {
+    #[cfg(target_pointer_width = "64")]
+    {
+        windows::Win32::Foundation::HINSTANCE(m.0 as i64)
+    }
+    #[cfg(target_pointer_width = "32")]
+    {
+        windows::Win32::Foundation::HINSTANCE(m.0 as i32)
+    }
 }
 
 fn absolute_path(p: &str) -> String {
